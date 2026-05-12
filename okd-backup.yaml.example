@@ -1,0 +1,15 @@
+# okd-backup configuration file
+# Copy to ~/.config/okd-backup/config.yaml or ./okd-backup.yaml
+# All fields are optional — command-line flags always take precedence.
+
+# Default directory where backups are stored
+# backup_dir: /mnt/nfs/okd-backups
+
+# Hostname or IP of a control plane node (required for --etcd)
+# control_plane: 192.168.1.10
+
+# Path to the SSH private key for control plane access
+# ssh_key: ~/.ssh/okd_key
+
+# SSH user for control plane access (default: core)
+# ssh_user: core

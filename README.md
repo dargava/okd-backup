@@ -56,7 +56,7 @@
 - **Verbose mode** — show all `oc`/`kubectl` commands as they run
 - **Dependency check** — `okd-backup deps` lists all required tools and verifies they are installed
 - **Shell completion** — tab-completion for bash and zsh
-- **Single static binary** — built with Go; no Python, pip, or runtime dependencies required
+- **Single static binary** — built with Go
 
 ---
 
@@ -67,8 +67,6 @@
 | `oc` or `kubectl` | Must be in `PATH` and logged into the cluster |
 | SSH access to a control plane node | Required for `--etcd` only |
 | NFS mount or local directory | Backup storage destination |
-
-No Python, pip, or other runtime dependencies are required.
 
 ---
 

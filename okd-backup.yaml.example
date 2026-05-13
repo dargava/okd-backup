@@ -13,3 +13,7 @@
 
 # SSH user for control plane access (default: core)
 # ssh_user: core
+
+# Container image for PVC backup/restore pods (must include rsync and tar)
+# Override when the default Red Hat registry is unreachable from your cluster
+# pvc_image: registry.access.redhat.com/ubi8/ubi8:latest

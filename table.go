@@ -6,7 +6,7 @@ import (
 	"unicode/utf8"
 )
 
-// Table is a simple ASCII table renderer with ANSI color support.
+// Table is a simple table renderer with Unicode box-drawing characters and ANSI color support.
 type Table struct {
 	title      string
 	headers    []string
@@ -111,31 +111,37 @@ func (t *Table) print() {
 		}
 	}
 
+	// Box-drawing helpers
+	hbar := func(left, mid, right string) string {
+		s := left
+		for i, w := range widths {
+			s += strings.Repeat("─", w+2)
+			if i < ncols-1 {
+				s += mid
+			}
+		}
+		return s + right
+	}
+
 	// Print title
 	if t.title != "" {
 		fmt.Printf("\n%s%s%s\n", colorBold+colorBlue, t.title, colorReset)
 	}
 
-	// Build separator line
-	sep := "+"
-	for _, w := range widths {
-		sep += strings.Repeat("-", w+2) + "+"
-	}
-
-	fmt.Println(sep)
+	fmt.Println(hbar("┌", "┬", "┐"))
 
 	// Print header
-	fmt.Print("|")
+	fmt.Print("│")
 	for i, h := range t.headers {
 		cell := colorBold + colorBlue + h + colorReset
-		fmt.Printf(" %s |", padRight(cell, widths[i]))
+		fmt.Printf(" %s │", padRight(cell, widths[i]))
 	}
 	fmt.Println()
-	fmt.Println(sep)
+	fmt.Println(hbar("├", "┼", "┤"))
 
 	// Print rows
 	for _, row := range t.rows {
-		fmt.Print("|")
+		fmt.Print("│")
 		for i := 0; i < ncols; i++ {
 			cell := ""
 			if i < len(row) {
@@ -145,13 +151,13 @@ func (t *Table) print() {
 				cell = t.colFmt[i](cell)
 			}
 			if t.rightAlign[i] {
-				fmt.Printf(" %s |", padLeft(cell, widths[i]))
+				fmt.Printf(" %s │", padLeft(cell, widths[i]))
 			} else {
-				fmt.Printf(" %s |", padRight(cell, widths[i]))
+				fmt.Printf(" %s │", padRight(cell, widths[i]))
 			}
 		}
 		fmt.Println()
 	}
 
-	fmt.Println(sep)
+	fmt.Println(hbar("└", "┴", "┘"))
 }

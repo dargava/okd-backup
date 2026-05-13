@@ -13,6 +13,16 @@ var validConfigKeys = map[string]bool{
 	"control_plane": true,
 	"ssh_key":       true,
 	"ssh_user":      true,
+	"pvc_image":     true,
+}
+
+// configDefaults holds the built-in default for each key that has one.
+// Keys absent from this map (e.g. control_plane) have no meaningful default.
+var configDefaults = map[string]string{
+	"backup_dir": defaultBackupDir,
+	"ssh_key":    "~/.ssh/id_ed25519",
+	"ssh_user":   "core",
+	"pvc_image":  defaultPVCImage,
 }
 
 var (

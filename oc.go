@@ -55,6 +55,19 @@ func runOc(args []string, namespace string) (int, string, string) {
 	return rc, strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String())
 }
 
+// runOcStream runs an oc/kubectl command and streams stdout/stderr directly to
+// the terminal. Used for long-running commands like release extraction.
+func runOcStream(args []string) error {
+	if ocBin == "" {
+		return fmt.Errorf("neither oc nor kubectl found in PATH")
+	}
+	logVerbose(fmt.Sprintf("  $ %s %s", ocBin, strings.Join(args, " ")))
+	cmd := exec.Command(ocBin, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // applyFile runs `oc apply -f <file>` and returns any error.
 func applyFile(file string, dryRun bool) error {
 	args := []string{"apply", "-f", file}

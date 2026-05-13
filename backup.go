@@ -15,10 +15,14 @@ import (
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (
-	backupPodPrefix = "okd-backup-pvc-"
-	mountPath       = "/mnt/pvc"
-	debugImage      = "registry.access.redhat.com/ubi8/ubi8:latest"
+	backupPodPrefix    = "okd-backup-pvc-"
+	mountPath          = "/mnt/pvc"
+	defaultPVCImage    = "registry.access.redhat.com/ubi8/ubi8:latest"
 )
+
+// pvcImage is the container image used for PVC backup/restore pods.
+// Set by the backup/restore commands via --pvc-image or the pvc_image config key.
+var pvcImage = defaultPVCImage
 
 var namespaceResourceTypes = []string{
 	"deployments", "statefulsets", "daemonsets", "services",
@@ -481,6 +485,167 @@ func backupClusterConfig(ctx *BackupContext, dryRun bool) error {
 	return nil
 }
 
+// ── Release tools download ────────────────────────────────────────────────────
+
+// currentReleaseImage returns the image reference of the currently running
+// cluster version (from clusterversion/version .status.desired.image).
+func currentReleaseImage() (string, error) {
+	rc, out, _ := runOc([]string{
+		"get", "clusterversion", "version",
+		"-o", "jsonpath={.status.desired.image}",
+	}, "")
+	if rc != 0 || out == "" {
+		return "", fmt.Errorf("could not read cluster version — is the cluster reachable?")
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// releaseNameFromInfo runs `oc adm release info <image>` and returns the
+// human-readable name from the Name: field in the output.
+func releaseNameFromInfo(image string) (string, error) {
+	rc, out, _ := runOc([]string{"adm", "release", "info", image}, "")
+	if rc != 0 {
+		return "", fmt.Errorf("oc adm release info failed")
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "Name:") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+			if name != "" {
+				return name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("Name field not found in release info output")
+}
+
+// DownloadedTools holds metadata about one downloaded release tools set.
+type DownloadedTools struct {
+	Name       string
+	Image      string
+	Downloaded string
+	Dir        string
+}
+
+// downloadTools extracts OKD release tools into storageRoot/tools/<name>/.
+// The name is resolved via `oc adm release info`; falls back to the image tag.
+// A .download-complete marker is written on success; its presence causes
+// subsequent calls to skip the download unless force is true.
+// A release-info.txt file is written with the image, name, and timestamp.
+// Unless yes is true, a confirmation prompt is shown before downloading.
+func downloadTools(storageRoot, releaseImage string, force, yes, dryRun bool) (string, error) {
+	logSection("OKD release tools download")
+
+	logInfo(fmt.Sprintf("  Release image: %s", releaseImage))
+	logInfo("  Resolving release name …")
+
+	name, err := releaseNameFromInfo(releaseImage)
+	if err != nil {
+		// fall back to the tag portion of the image reference
+		if i := strings.LastIndex(releaseImage, ":"); i >= 0 && i < len(releaseImage)-1 {
+			name = releaseImage[i+1:]
+		} else {
+			name = releaseImage
+		}
+		logVerbose(fmt.Sprintf("  release info unavailable, using: %s", name))
+	} else {
+		logInfo(fmt.Sprintf("  Release name:  %s", name))
+	}
+
+	toolsDir := filepath.Join(storageRoot, "tools", name)
+	marker := filepath.Join(toolsDir, ".download-complete")
+
+	logInfo(fmt.Sprintf("  Output:        %s", toolsDir))
+
+	if !force {
+		if _, err := os.Stat(marker); err == nil {
+			logSuccess("Already downloaded — skipping (use --force to re-download)")
+			return toolsDir, nil
+		}
+	}
+
+	if dryRun {
+		logInfo(fmt.Sprintf("  [dry-run] oc adm release extract --tools %s --to=%s", releaseImage, toolsDir))
+		return toolsDir, nil
+	}
+
+	if !yes {
+		fmt.Println()
+		logInfo(fmt.Sprintf("  About to download release tools for: %s", name))
+		logInfo(fmt.Sprintf("  Destination: %s", toolsDir))
+		fmt.Print("\nDownload release tools? [y/N] ")
+		var ans string
+		fmt.Scanln(&ans)
+		if strings.ToLower(strings.TrimSpace(ans)) != "y" {
+			logInfo("Aborted.")
+			return toolsDir, nil
+		}
+	}
+
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		return "", err
+	}
+
+	if err := runOcStream([]string{
+		"adm", "release", "extract",
+		"--tools", releaseImage,
+		fmt.Sprintf("--to=%s", toolsDir),
+	}); err != nil {
+		return "", fmt.Errorf("oc adm release extract: %w", err)
+	}
+
+	// Write human-readable info file alongside the tools
+	infoContent := fmt.Sprintf("image=%s\nname=%s\ndownloaded=%s\n",
+		releaseImage, name, time.Now().UTC().Format(time.RFC3339))
+	_ = os.WriteFile(filepath.Join(toolsDir, "release-info.txt"), []byte(infoContent), 0644)
+
+	_ = os.WriteFile(marker, []byte(releaseImage+"\n"), 0644)
+
+	logSuccess("Release tools downloaded successfully")
+	return toolsDir, nil
+}
+
+// listDownloadedTools returns metadata for every tools set found under
+// storageRoot/tools/. Entries without release-info.txt are included with
+// only the directory name populated.
+func listDownloadedTools(storageRoot string) ([]DownloadedTools, error) {
+	toolsRoot := filepath.Join(storageRoot, "tools")
+	entries, err := os.ReadDir(toolsRoot)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var result []DownloadedTools
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dt := DownloadedTools{Name: entry.Name(), Dir: filepath.Join(toolsRoot, entry.Name())}
+
+		data, err := os.ReadFile(filepath.Join(dt.Dir, "release-info.txt"))
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				switch parts[0] {
+				case "image":
+					dt.Image = parts[1]
+				case "name":
+					dt.Name = parts[1]
+				case "downloaded":
+					dt.Downloaded = parts[1]
+				}
+			}
+		}
+		result = append(result, dt)
+	}
+	return result, nil
+}
+
 // ── Pod helpers ───────────────────────────────────────────────────────────────
 
 func createPVCPod(podName, namespace, pvcName string, restricted bool, mode string) error {
@@ -550,7 +715,7 @@ spec:
     volumeMounts:
     - name: pvc-data
       mountPath: %s%s
-`, podName, namespace, appLabel, podSecCtx, pvcName, containerName, debugImage, mountPath, containerSecCtx)
+`, podName, namespace, appLabel, podSecCtx, pvcName, containerName, pvcImage, mountPath, containerSecCtx)
 }
 
 func waitForPod(podName, namespace string, timeout int) error {

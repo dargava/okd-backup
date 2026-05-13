@@ -3,7 +3,7 @@
 > CLI tool for backing up and restoring OKD / OpenShift clusters to NFS or local storage.
 
 ![Go](https://img.shields.io/badge/go-1.21%2B-00ADD8)
-![Version](https://img.shields.io/badge/version-0.9.4-green)
+![Version](https://img.shields.io/badge/version-0.11.6-green)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
@@ -17,7 +17,11 @@
 - [Quick start](#quick-start)
 - [Commands](#commands)
   - [backup](#backup)
+    - [backup list](#backup-list)
+  - [download](#download)
+    - [download list](#download-list)
   - [list](#list)
+    - [list tree](#list-tree)
   - [restore list](#restore-list)
   - [restore run](#restore-run)
   - [info](#info)
@@ -29,6 +33,7 @@
     - [schedule list](#schedule-list)
     - [schedule remove](#schedule-remove)
   - [cleanup](#cleanup)
+  - [version](#version)
   - [completion](#completion)
 - [Can I use this for a full cluster restore?](#can-i-use-this-for-a-full-cluster-restore)
 - [Backup storage layout](#backup-storage-layout)
@@ -36,7 +41,6 @@
 - [Limitations](#limitations)
 - [Shell completion](#shell-completion)
 - [Third-party licenses](#third-party-licenses)
-- [Contributing](#contributing)
 
 ---
 
@@ -46,17 +50,20 @@
 - **Namespace resources** — all Kubernetes/OpenShift resources exported as YAML per namespace
 - **PVC data** — persistent volume contents copied via `oc rsync` using a temporary pod
 - **Cluster-wide config** — OAuth, ingress, operators, CRDs, ClusterRoles, StorageClasses
+- **Release tools download** — `oc adm release extract --tools` stored once per OKD version; auto-detects current cluster version; lists downloaded sets
 - **Selective restore** — restore a single namespace, a single resource type, or everything
 - **Namespace mapping** — restore into a different namespace (e.g. `production` → `staging`)
-- **Config file** — set defaults for `backup_dir`, `control_plane`, `ssh_key`, `ssh_user`
+- **etcd restore via SSH** — upload snapshot and run `cluster-restore.sh` without a live cluster API
+- **Config file** — set defaults for `backup_dir`, `control_plane`, `ssh_key`, `ssh_user`, `pvc_image`
 - **Auto-detect control plane** — finds and probes control plane nodes automatically
 - **Scheduled backups** — generates a systemd timer or crontab entry, with optional `--install`
 - **Cleanup** — remove old backups by age, count, ID, or empty/failed state
+- **Backup browser** — `list tree` shows the full directory structure of any backup
 - **Dry-run mode** — simulate any operation without making changes
 - **Verbose mode** — show all `oc`/`kubectl` commands as they run
-- **Dependency check** — `okd-backup deps` lists all required tools and verifies they are installed
+- **Dependency check** — `deps` lists all required tools and verifies they are installed
 - **Shell completion** — tab-completion for bash and zsh
-- **Single static binary** — built with Go
+- **Single static binary** — built with Go; no runtime dependencies required
 
 ---
 
@@ -68,14 +75,16 @@
 | SSH access to a control plane node | Required for `--etcd` only |
 | NFS mount or local directory | Backup storage destination |
 
+No runtime dependencies beyond the `oc` or `kubectl` binary and SSH access.
+
 ---
 
 ## Installation
 
-okd-backup is a single static Go binary. Build it from source:
+okd-backup is a single static Go binary with no external runtime dependencies.
 
 ```bash
-# Build
+# Build from source
 git clone <repo-url>
 cd okd-backup
 go build -ldflags="-s -w" -o okd-backup .
@@ -85,7 +94,7 @@ sudo cp okd-backup /usr/local/bin/okd-backup
 okd-backup version
 ```
 
-Or download a pre-built binary (if available) and copy it directly:
+Or download a pre-built binary and install directly:
 
 ```bash
 chmod +x okd-backup
@@ -96,8 +105,8 @@ sudo cp okd-backup /usr/local/bin/okd-backup
 
 ## Configuration
 
-okd-backup can read defaults from a config file so you don't have to pass
-`--backup-dir`, `--control-plane`, and `--ssh-key` on every command.
+Set defaults once so you don't have to repeat `--backup-dir`, `--control-plane`,
+and `--ssh-key` on every command.
 
 ### Quick setup
 
@@ -120,11 +129,12 @@ backup_dir: /mnt/nfs/okd-backups
 control_plane: 192.168.1.10
 ssh_key: ~/.ssh/okd_key
 ssh_user: core
+pvc_image: registry.access.redhat.com/ubi8/ubi8:latest
 ```
 
-### Search order
+### Config file search order
 
-The config file is found by checking these locations in order (first match wins):
+The first file found wins:
 
 | Priority | Source |
 |---|---|
@@ -145,8 +155,11 @@ okd-backup config set backup_dir /mnt/nfs/okd-backups
 okd-backup config set control_plane 192.168.1.10
 okd-backup config set ssh_key ~/.ssh/okd_key
 
-# Back up everything
+# Back up everything (etcd, namespaces, cluster-config)
 okd-backup backup --all
+
+# Download the current release tools (for DR purposes)
+okd-backup download --yes
 
 # List available backups
 okd-backup list
@@ -169,33 +182,36 @@ okd-backup backup [OPTIONS]
 
 | Option | Default | Description |
 |---|---|---|
-| `--all` | — | Back up everything |
-| `--etcd` | — | etcd snapshot (requires `--control-plane`) |
+| `--all` | — | Back up etcd, namespaces, and cluster-config (PVCs excluded) |
+| `--etcd` | — | etcd snapshot (requires SSH to control plane) |
 | `--namespaces TEXT` | — | Comma-separated list of namespaces |
-| `--pvcs` | — | PVC data |
+| `--pvcs` | — | PVC data (always explicit; not included in `--all`) |
 | `--cluster-config` | — | OAuth, ingress, operators, CRDs |
 | `--no-secrets` | — | Skip secrets |
-| `--backup-dir TEXT` | config / cwd | Storage location |
 | `--control-plane TEXT` | config | Hostname or IP of a control plane node |
-| `--ssh-key TEXT` | config / `~/.ssh/id_rsa` | SSH private key |
+| `--ssh-key TEXT` | config / `~/.ssh/id_ed25519` | SSH private key |
 | `--ssh-user TEXT` | config / `core` | SSH user |
+| `--pvc-image TEXT` | config / `ubi8` | Container image for PVC backup pods |
+| `--backup-dir TEXT` | config / cwd | Storage location |
 | `--dry-run` | — | Simulate without changes |
 | `--verbose` | — | Show `oc`/`kubectl` output |
 | `--config PATH` | — | Path to config file |
 
+> **Note:** `--pvcs` must always be specified explicitly. It is intentionally excluded from `--all` because PVCs may use `ReadWriteOnce` access mode and be mounted by a running pod.
+
 **Examples:**
 
 ```bash
-# Everything (using values from config file)
+# Everything (etcd + namespaces + cluster-config) using config file defaults
 okd-backup backup --all
 
 # etcd only with explicit options
 okd-backup backup --etcd --control-plane 192.168.1.10 --ssh-key ~/.ssh/okd_key
 
-# Specific namespaces, skip secrets
-okd-backup backup --namespaces production,staging --no-secrets
+# Specific namespaces only
+okd-backup backup --namespaces production,staging
 
-# PVC data for one namespace
+# PVC data for specific namespaces (separate from --all)
 okd-backup backup --pvcs --namespaces production
 
 # Cluster-wide config only
@@ -207,12 +223,85 @@ okd-backup backup --all --dry-run --verbose
 
 ---
 
+### backup list
+
+List all available backups from within the `backup` command group — equivalent
+to `okd-backup list`.
+
+```bash
+okd-backup backup list
+okd-backup backup list --unit MB
+okd-backup backup list --backup-dir /mnt/nfs/okd-backups
+```
+
+---
+
+### download
+
+Download OKD release tools for disaster recovery. Tools are stored at
+`<backup-dir>/tools/<release-name>/` — **shared across all backups** and only
+downloaded once per OKD version.
+
+Without `--release-image`, the current cluster version is detected automatically
+via `oc get clusterversion`. The human-readable release name is resolved from
+`oc adm release info` and used as the directory name. A `release-info.txt` file
+records the image reference, name, and download timestamp.
+
+A confirmation prompt is shown before downloading. Use `--yes` to skip it.
+
+```
+okd-backup download [OPTIONS]
+okd-backup download list [OPTIONS]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--release-image TEXT` | auto-detect | OKD release image (SHA256 or tag reference) |
+| `--backup-dir TEXT` | config / cwd | Storage location |
+| `--force` | — | Re-download even if already present |
+| `--yes` / `-y` | — | Skip the confirmation prompt |
+| `--dry-run` | — | Simulate without changes |
+| `--verbose` | — | Show `oc` command output |
+| `--config PATH` | — | Path to config file |
+
+**Examples:**
+
+```bash
+# Auto-detect current cluster version and download
+okd-backup download
+
+# Skip confirmation (for scripts or automation)
+okd-backup download --yes
+
+# Specify an explicit image (tagged or SHA256 reference)
+okd-backup download \
+  --release-image registry.ci.openshift.org/origin/release-scos:4.22.0-0.okd-scos-2026-02-21-014526 \
+  --yes
+
+# Force re-download (e.g. after an interrupted download)
+okd-backup download --force --yes
+```
+
+#### download list
+
+List all downloaded release tool sets.
+
+```bash
+okd-backup download list
+okd-backup download list --backup-dir /mnt/nfs/okd-backups
+```
+
+Shows the release name, download timestamp, and source image for each downloaded set.
+
+---
+
 ### list
 
 List all available backups. Shortcut for `restore list`.
 
 ```
 okd-backup list [OPTIONS]
+okd-backup list tree <backup-id> [OPTIONS]
 ```
 
 | Option | Default | Description |
@@ -225,6 +314,33 @@ okd-backup list [OPTIONS]
 okd-backup list
 okd-backup list --unit MB
 okd-backup list --backup-dir /mnt/nfs/okd-backups
+```
+
+#### list tree
+
+Show the full directory tree of a specific backup.
+
+```bash
+okd-backup list tree 2024-01-15_0200
+okd-backup list tree 2024-01-15_0200 --backup-dir /mnt/nfs/okd-backups
+```
+
+Example output:
+
+```
+2024-01-15_0200/
+├── metadata.json
+├── cluster-config/
+│   ├── ingress.yaml
+│   └── oauth.yaml
+├── etcd/
+│   ├── snapshot.db
+│   └── static_kuberesources_2024-01-15_020010.tar.gz
+└── namespaces/
+    └── production/
+        ├── deployments.yaml
+        ├── secrets.yaml
+        └── services.yaml
 ```
 
 ---
@@ -248,14 +364,13 @@ The **Contents** column shows which components were included:
 | Value | Description |
 |---|---|
 | `etcd` | etcd snapshot — full cluster state, certificates, all resources |
-| `namespaces` | Per-namespace YAML files (deployments, services, configmaps, secrets, routes, …) |
+| `namespaces` | Per-namespace YAML exports (deployments, services, configmaps, secrets, routes, …) |
 | `pvcs` | Actual data inside PersistentVolumes, copied via `oc rsync` |
 | `cluster-config` | Cluster-wide config: OAuth, ingress, operators, CRDs, ClusterRoles, StorageClasses |
 
 ```bash
 okd-backup restore list
 okd-backup restore list --unit MB
-okd-backup restore list --backup-dir /mnt/nfs/okd-backups
 ```
 
 ---
@@ -270,41 +385,43 @@ okd-backup restore run --backup-id <ID> [OPTIONS]
 
 | Option | Default | Description |
 |---|---|---|
-| `--backup-id TEXT` | **required** | Backup ID from `restore list` |
+| `--backup-id TEXT` | **required** | Backup ID from `list` |
 | `--etcd` | — | Restore etcd snapshot via SSH (cluster API may be down) |
 | `--namespace TEXT` | — | Restore a single namespace |
 | `--namespaces TEXT` | — | Comma-separated list of namespaces |
 | `--type TEXT` | — | Restore a single resource type (e.g. `deployments`) |
 | `--pvcs` | — | Restore PVC data |
 | `--cluster-config` | — | Restore cluster configuration |
-| `--force-config` | — | Also restore `clusterversion`, `crds` (dangerous) |
+| `--force-config` | — | Also restore `clusterversion` and CRDs (dangerous) |
 | `--map-namespace TEXT` | — | Remap namespace: `old:new` |
-| `--control-plane TEXT` | config | Hostname or IP of a control plane node (required for `--etcd`) |
-| `--ssh-key TEXT` | config / `~/.ssh/id_rsa` | SSH private key (for `--etcd`) |
+| `--control-plane TEXT` | config | Hostname or IP of a control plane node (for `--etcd`) |
+| `--ssh-key TEXT` | config / `~/.ssh/id_ed25519` | SSH private key (for `--etcd`) |
 | `--ssh-user TEXT` | config / `core` | SSH user (for `--etcd`) |
+| `--pvc-image TEXT` | config / `ubi8` | Container image for PVC restore pods |
 | `--backup-dir TEXT` | config / cwd | Storage location |
 | `--dry-run` | — | Simulate without changes |
 | `--verbose` | — | Show `oc`/`kubectl` output |
 | `--yes` / `-y` | — | Auto-create missing namespaces; skip etcd restore confirmation |
 | `--config PATH` | — | Path to config file |
 
-If a target namespace does not exist, `restore run` will prompt you to create it
-before starting. Pass `--yes` to skip the prompt (useful in scripts).
+If a target namespace does not exist, `restore run` prompts to create it before
+starting. Pass `--yes` to create automatically (useful in scripts).
 
 **Examples:**
 
 ```bash
-# Restore a single namespace
+# Restore all resources in a namespace
 okd-backup restore run --backup-id 2024-01-15_0200 --namespace production
 
-# Restore only deployments
+# Restore only deployments in a namespace
 okd-backup restore run --backup-id 2024-01-15_0200 --namespace production --type deployments
 
-# Restore PVC data
+# Restore PVC data for a namespace
 okd-backup restore run --backup-id 2024-01-15_0200 --pvcs --namespace production
 
 # Restore into a different namespace
-okd-backup restore run --backup-id 2024-01-15_0200 --namespace production --map-namespace production:staging
+okd-backup restore run --backup-id 2024-01-15_0200 --namespace production \
+  --map-namespace production:staging
 
 # Restore cluster config (safe resources only)
 okd-backup restore run --backup-id 2024-01-15_0200 --cluster-config
@@ -312,28 +429,33 @@ okd-backup restore run --backup-id 2024-01-15_0200 --cluster-config
 # Restore cluster config including clusterversion and CRDs
 okd-backup restore run --backup-id 2024-01-15_0200 --cluster-config --force-config
 
+# etcd restore (cluster API may be down)
+okd-backup restore run --backup-id 2024-01-15_0200 --etcd \
+  --control-plane 192.168.1.10 --ssh-key ~/.ssh/okd_key
+
 # Dry run
 okd-backup restore run --backup-id 2024-01-15_0200 --namespace production --dry-run
 ```
 
 #### What is automatically skipped or modified during restore
 
-Some resources are auto-managed by Kubernetes/OKD controllers and cannot or should not be applied manually. `restore run` handles these transparently:
+Some resources are auto-managed by Kubernetes/OKD controllers and cannot or should
+not be applied manually. `restore run` handles these transparently:
 
 | Resource | What happens | Why |
 |---|---|---|
 | `secrets` with `type: kubernetes.io/service-account-token` | **Skipped** | Auto-created by the SA controller; OKD 4.x forbids manually creating these |
 | `secrets` with `type: kubernetes.io/dockercfg` | **Skipped** | Auto-created pull secrets; same restriction |
-| `serviceaccounts` — `secrets` field | **Stripped** | Lists stale token secret names; the SA controller repopulates it automatically |
+| `serviceaccounts` — `secrets` field | **Stripped** | Lists stale token secret names; the SA controller repopulates it |
 | `services` — `spec.clusterIP` / `spec.clusterIPs` | **Stripped** | Cluster-assigned IPs; headless services (`None`) are preserved |
 | `jobs` — `spec.selector` and UID labels | **Stripped** | Auto-generated by the Job controller; carrying them across causes label-mismatch errors |
-| `persistentvolumeclaims` — `spec.volumeName` | **Stripped** | References a PV by name that may not exist in the target cluster; stripping lets the provisioner assign a new one |
+| `persistentvolumeclaims` — `spec.volumeName` | **Stripped** | References a PV that may not exist in the target cluster; stripping lets the provisioner assign a new one |
 
-#### Known limitations (not auto-fixed)
+#### Known limitations
 
 | Resource | Issue |
 |---|---|
-| `routes` with auto-generated `spec.host` | The hostname contains the source cluster's wildcard domain — the route is restored as-is and will point to the wrong address if the base domain differs. Manually update `spec.host` after restore, or delete the field before backup if you want OKD to auto-generate a new one. |
+| `routes` with auto-generated `spec.host` | The hostname contains the source cluster's wildcard domain. The route is restored as-is and will point to the wrong address if the base domain differs. Manually update `spec.host` after restore, or delete the field before backup if you want OKD to generate a new one. |
 
 ---
 
@@ -370,7 +492,7 @@ okd-backup config <SUBCOMMAND>
 |---|---|
 | `set <key> <value>` | Set a configuration value |
 | `unset <key>` | Remove a key from the config |
-| `show` | Display active config and its file location |
+| `show` | Display all keys with current values and source (`set` / `default`) |
 | `path` | Show the config file search order |
 
 **Valid keys:**
@@ -379,8 +501,13 @@ okd-backup config <SUBCOMMAND>
 |---|---|---|
 | `backup_dir` | Default backup storage directory | `/mnt/nfs/okd-backups` |
 | `control_plane` | Hostname or IP of the control plane node | — |
-| `ssh_key` | Path to the SSH private key | `~/.ssh/id_rsa` |
+| `ssh_key` | Path to the SSH private key | `~/.ssh/id_ed25519` |
 | `ssh_user` | SSH user for control plane access | `core` |
+| `pvc_image` | Container image for PVC backup/restore pods | `ubi8` |
+
+> `config show` always displays all keys, marking built-in defaults as `default`
+> and values from the config file as `set`. Useful for verifying your configuration
+> at a glance even before a config file has been created.
 
 **Examples:**
 
@@ -389,6 +516,7 @@ okd-backup config set backup_dir /mnt/nfs/okd-backups
 okd-backup config set control_plane 192.168.1.10
 okd-backup config set ssh_key ~/.ssh/okd_key
 okd-backup config set ssh_user core
+okd-backup config set pvc_image registry.example.com/mirror/ubi8:latest
 
 okd-backup config show
 okd-backup config unset control_plane
@@ -424,7 +552,7 @@ okd-backup detect --ssh-port 2222
 ```
 
 When `--control-plane` is not set and no value exists in the config file,
-`okd-backup backup --etcd` (or `--all`) will call `detect` automatically.
+`backup --etcd` (and `--all`) will call `detect` automatically.
 
 ---
 
@@ -432,46 +560,37 @@ When `--control-plane` is not set and no value exists in the config file,
 
 Show all required external dependencies and check whether they are available.
 
-```
+```bash
 okd-backup deps
 ```
 
-Displays two tables:
+Displays three sections:
 
 **External binaries**
 
 | Binary | Purpose | Required for |
 |---|---|---|
-| `oc` | Cluster interaction (preferred) | all cluster operations |
-| `kubectl` | Cluster interaction (fallback) | all cluster operations |
+| `oc` | Cluster interaction (preferred) | All cluster operations |
+| `kubectl` | Cluster interaction (fallback) | All cluster operations |
 | `rsync` | PVC data transfer | `backup/restore --pvcs` |
 | `systemctl` | systemd schedule management | `schedule --type systemd` |
 | `crontab` | cron schedule management | `schedule --type cron` |
 
-**Go runtime**
+**Go modules** (embedded in the binary)
 
-| Module | Purpose | Required for |
-|---|---|---|
-| `github.com/spf13/cobra` | CLI framework | all |
-| `golang.org/x/crypto/ssh` | SSH to control plane | `backup --etcd` |
-| `github.com/pkg/sftp` | SFTP file download | `backup --etcd` |
-| `gopkg.in/yaml.v3` | Config file parsing | config |
+| Module | Purpose |
+|---|---|
+| `github.com/spf13/cobra` | CLI framework |
+| `golang.org/x/crypto/ssh` | SSH to control plane |
+| `github.com/pkg/sftp` | SFTP file transfer |
+| `gopkg.in/yaml.v3` | Config file parsing |
 
-**Cluster access** (shown when `oc` or `kubectl` is available)
+**Cluster access**
 
 | Check | Description |
 |---|---|
-| Logged in | Runs `oc whoami`; shows the active username |
-| cluster-admin | Runs `oc auth can-i '*' '*' --all-namespaces`; warns if not granted |
-
-At least one of `oc` or `kubectl` must be present. The command exits with a
-non-zero status if any required dependency is missing or if the cluster login
-check fails. A missing `cluster-admin` role produces a warning but does not
-fail the command (namespace-level backups may still work).
-
-```bash
-okd-backup deps
-```
+| Logged in | `oc whoami` — shows the active username |
+| cluster-admin | `oc auth can-i '*' '*' --all-namespaces` — warns if not granted |
 
 ---
 
@@ -489,8 +608,6 @@ okd-backup schedule <SUBCOMMAND>
 | `generate` | Generate (and optionally install) a schedule |
 | `list` | List all installed okd-backup schedules |
 | `remove` | Remove an installed schedule |
-
----
 
 #### schedule generate
 
@@ -517,8 +634,6 @@ okd-backup schedule generate --on-calendar "Mon..Fri 03:00"
 okd-backup schedule generate --install
 ```
 
----
-
 #### schedule list
 
 List all installed okd-backup schedules — checks both systemd timers and crontab.
@@ -526,10 +641,6 @@ List all installed okd-backup schedules — checks both systemd timers and cront
 ```bash
 okd-backup schedule list
 ```
-
-Shows: timer name, next/last trigger time, active state, and the `ExecStart` command for systemd timers; expression and command for crontab entries.
-
----
 
 #### schedule remove
 
@@ -546,17 +657,9 @@ okd-backup schedule remove [OPTIONS]
 | `-y` / `--yes` | — | Skip confirmation |
 
 ```bash
-okd-backup schedule remove              # remove all (systemd + cron)
-okd-backup schedule remove --type cron  # only crontab entries
+okd-backup schedule remove                                     # remove all
+okd-backup schedule remove --type cron                        # crontab only
 okd-backup schedule remove --type systemd --unit-name okd-backup-weekly
-```
-
-After removing the systemd timer, useful commands:
-
-```bash
-systemctl status okd-backup.timer
-journalctl -u okd-backup.service -f
-systemctl start okd-backup.service    # trigger a manual run
 ```
 
 ---
@@ -580,11 +683,10 @@ okd-backup cleanup [OPTIONS]
 | `--dry-run` | Preview what would be removed without deleting |
 | `-y` / `--yes` | Skip the confirmation prompt |
 
-Modes can be combined — for example `--keep 10 --empty` keeps the 10 most
-recent and also removes any empty backups regardless of age.
+Options can be combined — for example `--keep 10 --empty` keeps the 10 most recent
+and also removes any empty backups regardless of age.
 
 Always shows a preview table with sizes and reasons before deleting.
-Asks for confirmation unless `--yes` is passed.
 
 **Examples:**
 
@@ -598,39 +700,41 @@ okd-backup cleanup --older-than 30
 # Remove a specific backup
 okd-backup cleanup --backup-id 2024-01-15_0200
 
-# Remove multiple specific backups
-okd-backup cleanup --backup-id 2024-01-10_0200 --backup-id 2024-01-11_0200
-
 # Remove failed/empty backups
 okd-backup cleanup --empty
 
-# Combine: keep last 10, also remove empty ones
+# Combine: keep last 10 and remove empty ones
 okd-backup cleanup --keep 10 --empty
 
 # Preview without deleting
 okd-backup cleanup --keep 5 --dry-run
 
-# Non-interactive (useful in scripts)
+# Non-interactive (for scripts)
 okd-backup cleanup --keep 5 --yes
+```
+
+---
+
+### version
+
+Print the current version.
+
+```bash
+okd-backup version
 ```
 
 ---
 
 ### completion
 
-Print a shell completion script to stdout.
-
-```
-okd-backup completion {bash|zsh}
-```
-
-Print a shell completion script to stdout.
+Generate a shell completion script.
 
 ```
 okd-backup completion {bash|zsh}
 ```
 
 ```bash
+# Load for the current session
 source <(okd-backup completion bash)
 source <(okd-backup completion zsh)
 ```
@@ -641,22 +745,29 @@ See [Shell completion](#shell-completion) for permanent installation.
 
 ## Can I use this for a full cluster restore?
 
-**Short answer:** yes, with caveats — etcd restore handles the cluster itself, the other commands handle application data on top of a running cluster.
+**Short answer:** yes, with caveats — etcd restore handles the cluster itself,
+the other commands handle application data on top of a running cluster.
 
 ### What this tool restores
 
-| Component | Command | Cluster must be running? |
+| Component | Command | Cluster API required? |
 |---|---|---|
-| etcd snapshot (full cluster state) | `restore run --etcd` | No — API server may be down |
+| etcd snapshot (full cluster state) | `restore run --etcd` | No — API may be down |
 | Namespace resources (deployments, services, …) | `restore run --namespace` | Yes |
 | PVC data | `restore run --pvcs` | Yes |
 | Cluster-wide config (OAuth, ingress, operators) | `restore run --cluster-config` | Yes |
+| Release tools (oc, openshift-install, …) | `download` | No — pulls from registry |
 
 ### Disaster recovery procedure
 
-If you have lost all control plane nodes:
+**Step 1 — Download release tools (do this before a disaster)**
 
-**Step 1 — Restore etcd on one control plane node**
+```bash
+# Store the exact tools for your OKD version alongside your backups
+okd-backup download --yes
+```
+
+**Step 2 — Restore etcd on one control plane node**
 
 Power off all other control plane nodes first, then:
 
@@ -665,30 +776,34 @@ okd-backup restore run --backup-id 2024-01-15_0200 --etcd \
   --control-plane 192.168.1.10 --ssh-key ~/.ssh/okd_key
 ```
 
-The tool will SSH in, upload the snapshot, run `cluster-restore.sh`, and print post-restore steps. After it completes:
+The tool will SSH in, upload the snapshot, run `cluster-restore.sh`, and print
+post-restore steps. After it completes:
 
 ```bash
-# On the control plane node:
+# On the control plane node
 sudo systemctl restart kubelet
 
-# From the bastion — wait for the API to come back:
+# From the bastion — wait for the API to come back
 oc get nodes
 
-# Approve any pending CSRs from nodes rejoining:
+# Approve any pending CSRs from nodes rejoining
 oc get csr | awk '/Pending/{print $1}' | xargs oc adm certificate approve
 ```
 
-**Step 2 — Reprovision other control plane nodes**
+**Step 3 — Reprovision other control plane nodes**
 
-The etcd restore leaves etcd as a single-member cluster. Other control plane nodes must be reprovisioned to rejoin. Refer to the [OKD disaster recovery docs](https://docs.okd.io/latest/backup_and_restore/control_plane_backup_and_restore/disaster_recovery/scenario-2-restoring-cluster-state.html) for this step.
+The etcd restore leaves etcd as a single-member cluster. Other control plane
+nodes must be reprovisioned to rejoin. Refer to the
+[OKD disaster recovery docs](https://docs.okd.io/latest/backup_and_restore/control_plane_backup_and_restore/disaster_recovery/scenario-2-restoring-cluster-state.html).
 
-**Step 3 — Restore application data (optional)**
+**Step 4 — Restore application data**
 
-Once the cluster is running, restore namespace resources and PVC data if needed:
+Once the cluster is running:
 
 ```bash
 okd-backup restore run --backup-id 2024-01-15_0200 --cluster-config
 okd-backup restore run --backup-id 2024-01-15_0200 --namespace production
+okd-backup restore run --backup-id 2024-01-15_0200 --pvcs --namespace production
 ```
 
 ### What this tool cannot do
@@ -697,7 +812,9 @@ okd-backup restore run --backup-id 2024-01-15_0200 --namespace production
 - Bootstrap a new cluster from scratch
 - Restore worker node OS state
 
-For a full from-scratch rebuild, install OKD first, then use `restore run --etcd` to restore cluster state, then `restore run --cluster-config` and `restore run --namespace` for application-level data.
+For a full from-scratch rebuild: install OKD, then use `restore run --etcd` to
+restore cluster state, followed by `restore run --cluster-config` and
+`restore run --namespace` for application-level data.
 
 ---
 
@@ -705,28 +822,35 @@ For a full from-scratch rebuild, install OKD first, then use `restore run --etcd
 
 ```
 <backup_dir>/
-└── 2024-01-15_0200/
-    ├── metadata.json                  ← backup_id, date, OKD version, contents
-    ├── etcd/
-    │   ├── snapshot.db
-    │   └── static_kuberesources_*.tar.gz
-    ├── namespaces/
-    │   ├── production/
-    │   │   ├── deployments.yaml
-    │   │   ├── services.yaml
-    │   │   ├── configmaps.yaml
-    │   │   ├── secrets.yaml
-    │   │   └── ...
-    │   └── staging/
-    │       └── ...
-    ├── pvcs/
-    │   └── production/
-    │       └── my-database-pvc/       ← rsync copy of PVC mountpoint
-    └── cluster-config/
-        ├── oauth.yaml
-        ├── ingress.yaml
-        ├── operator-subscriptions.yaml
-        └── ...
+├── 2024-01-15_0200/                   ← timestamped backup entry
+│   ├── metadata.json                  ← backup_id, date, OKD version, contents
+│   ├── etcd/
+│   │   ├── snapshot.db
+│   │   └── static_kuberesources_*.tar.gz
+│   ├── namespaces/
+│   │   ├── production/
+│   │   │   ├── deployments.yaml
+│   │   │   ├── services.yaml
+│   │   │   ├── configmaps.yaml
+│   │   │   ├── secrets.yaml
+│   │   │   └── ...
+│   │   └── staging/
+│   │       └── ...
+│   ├── pvcs/
+│   │   └── production/
+│   │       └── my-database-pvc/       ← rsync copy of PVC mountpoint
+│   └── cluster-config/
+│       ├── oauth.yaml
+│       ├── ingress.yaml
+│       ├── operator-subscriptions.yaml
+│       └── ...
+└── tools/                             ← shared; downloaded once per OKD version
+    └── 4.22.0-0.okd-scos-2026-02-21-014526/
+        ├── oc
+        ├── kubectl
+        ├── openshift-install
+        ├── release-info.txt           ← image, name, download timestamp
+        └── .download-complete         ← written after successful extraction
 ```
 
 `metadata.json` example:
@@ -734,7 +858,7 @@ For a full from-scratch rebuild, install OKD first, then use `restore run --etcd
 ```json
 {
   "backup_id": "2024-01-15_0200",
-  "created_at": "2024-01-15T02:00:04.123456",
+  "created_at": "2024-01-15T02:00:04Z",
   "cluster_version": "4.14.3",
   "contents": ["etcd", "namespaces", "pvcs", "cluster-config"]
 }
@@ -778,9 +902,9 @@ For a full from-scratch rebuild, install OKD first, then use `restore run --etcd
 
 ## Limitations
 
-- **etcd restore on a different cluster is not supported** — etcd snapshots contain cluster-specific certificates and node identities. Use `restore run` for cross-cluster migrations.
+- **etcd restore on a different cluster is not supported** — etcd snapshots contain cluster-specific certificates and node identities. Use `restore run --namespace` for cross-cluster migrations.
 - **PVC backup requires the PVC to be Bound** — unbound PVCs are silently skipped.
-- **`oc rsync` requires `rsync` and `tar`** inside the debug pod — the tool uses `ubi8` (full image) which ships both.
+- **`oc rsync` requires `rsync` and `tar` inside the pod** — the default `ubi8` image ships both; `ubi8-minimal` does not. Override with `--pvc-image` or the `pvc_image` config key if your cluster cannot reach `registry.access.redhat.com`.
 - **Cluster operators are backed up but not auto-restored** — use `--force-config` explicitly, as applying operator config to a running cluster can cause instability.
 
 ---
@@ -796,7 +920,7 @@ source <(okd-backup completion zsh)
 To load permanently:
 
 ```bash
-# bash — add to ~/.bashrc or ~/.bash_profile
+# bash — add to ~/.bashrc
 echo 'source <(okd-backup completion bash)' >> ~/.bashrc
 
 # zsh — add to ~/.zshrc
@@ -804,46 +928,32 @@ echo 'autoload -U compinit && compinit' >> ~/.zshrc
 echo 'source <(okd-backup completion zsh)' >> ~/.zshrc
 ```
 
-Completion is context-aware and reads your config file automatically:
+Completion is context-aware:
 
-| What | How |
+| Completion | Source |
 |---|---|
-| `--backup-id` | Lists real backup IDs from your configured `backup_dir` (reads config file, no `--backup-dir` needed) |
-| `--namespace` / `--namespaces` | Live query via `oc get namespaces` |
-| `--type` | Resource types for `restore run`; `systemd`/`cron`/`all` for `schedule` |
-| `config set <key>` | Valid keys: `backup_dir`, `control_plane`, `ssh_key`, `ssh_user` |
-| `config set <key> <value>` | Directory, file, hostname, or username completion depending on the key |
-| `--map-namespace` | Live namespace pairs e.g. `production:staging` |
-| `--unit-name` | Active timer names from `systemctl list-timers` |
-| `info <TAB>` | Existing backup IDs (positional argument) |
-| `schedule`/`config` subcommands | `generate list remove` / `show set unset path` |
+| `--backup-id` | Reads backup IDs from configured `backup_dir` |
+| `--namespace` / `--namespaces` | Live `oc get namespaces` |
+| `--type` | Resource type list for `restore run` |
+| `config set <key>` | Known config keys |
+| `config set <key> <value>` | Directory, file, hostname, or username depending on key |
+| `info <TAB>` | Existing backup IDs |
+| Subcommands | `restore list run`, `schedule generate list remove`, `config show set unset path`, `download list`, `list tree` |
 
 ---
 
 ## Third-party licenses
 
-okd-backup builds on the following open-source Go modules:
-
 | Module | License | Purpose |
 |---|---|---|
 | [github.com/spf13/cobra](https://github.com/spf13/cobra) | Apache-2.0 | CLI framework |
 | [github.com/spf13/pflag](https://github.com/spf13/pflag) | BSD-3-Clause | Flag parsing (via cobra) |
-| [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) | BSD-3-Clause | SSH client for etcd backup |
-| [github.com/pkg/sftp](https://github.com/pkg/sftp) | BSD-2-Clause | SFTP file download |
+| [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) | BSD-3-Clause | SSH client |
+| [github.com/pkg/sftp](https://github.com/pkg/sftp) | BSD-2-Clause | SFTP file transfer |
 | [gopkg.in/yaml.v3](https://github.com/go-yaml/yaml) | MIT | YAML config file parsing |
 | [github.com/kr/fs](https://github.com/kr/fs) | BSD-3-Clause | Filesystem helpers (via sftp) |
 
 Runtime tools called as external processes: `oc` / `kubectl` (Apache-2.0),
-`cluster-backup.sh` (Apache-2.0), `rsync` (GPL-3.0).
+`cluster-backup.sh` / `cluster-restore.sh` (Apache-2.0), `rsync` (GPL-3.0).
 
-See [LICENSES.md](LICENSES.md) for full details and license compatibility notes.
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-change`
-3. Make your changes
-4. Commit: `git commit -m "feat: description of change"`
-6. Open a merge request / pull request
+See [LICENSES.md](LICENSES.md) for full license texts.

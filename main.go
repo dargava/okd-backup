@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.9.4"
+const version = "0.11.6"
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -32,10 +32,14 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(backupCmd)
+	backupCmd.AddCommand(backupListCmd)
+	rootCmd.AddCommand(downloadCmd)
+	downloadCmd.AddCommand(downloadListCmd)
 	rootCmd.AddCommand(restoreCmd)
 	restoreCmd.AddCommand(restoreListCmd)
 	restoreCmd.AddCommand(restoreRunCmd)
 	rootCmd.AddCommand(listCmd)
+	listCmd.AddCommand(listTreeCmd)
 	rootCmd.AddCommand(infoCmd)
 	rootCmd.AddCommand(cleanupCmd)
 	rootCmd.AddCommand(scheduleCmd)
@@ -68,7 +72,24 @@ var backupCmd = &cobra.Command{
 	Use:   "backup",
 	Short: "Create a backup of the OKD cluster",
 	Long:  "Create a backup of the OKD cluster.",
-	RunE:  runBackup,
+	Example: `  # Back up everything (etcd + namespaces + cluster-config) using config file defaults
+  okd-backup backup --all
+
+  # etcd snapshot with explicit connection details
+  okd-backup backup --etcd --control-plane 192.168.1.10 --ssh-key ~/.ssh/okd_key
+
+  # Back up specific namespaces
+  okd-backup backup --namespaces production,staging
+
+  # Back up PVC data for a namespace (always explicit, not included in --all)
+  okd-backup backup --pvcs --namespaces production
+
+  # Cluster-wide config only
+  okd-backup backup --cluster-config
+
+  # Dry run with verbose output
+  okd-backup backup --all --dry-run --verbose`,
+	RunE: runBackup,
 }
 
 var (
@@ -82,6 +103,7 @@ var (
 	backupControlPlane string
 	backupSSHKey       string
 	backupSSHUser      string
+	backupPVCImage     string
 	backupDryRun       bool
 	backupVerbose      bool
 	backupConfig       string
@@ -97,11 +119,28 @@ func init() {
 	f.BoolVar(&backupNoSecrets, "no-secrets", false, "Skip secrets")
 	f.StringVar(&backupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
 	f.StringVar(&backupControlPlane, "control-plane", "", "Hostname or IP of a control plane node (required for --etcd)")
-	f.StringVar(&backupSSHKey, "ssh-key", "~/.ssh/id_rsa", "SSH private key for control plane access")
+	f.StringVar(&backupSSHKey, "ssh-key", "~/.ssh/id_ed25519", "SSH private key for control plane access")
 	f.StringVar(&backupSSHUser, "ssh-user", "core", "SSH user for control plane access")
+	f.StringVar(&backupPVCImage, "pvc-image", defaultPVCImage, "Container image used for PVC backup pods")
 	f.BoolVar(&backupDryRun, "dry-run", false, "Simulate without making changes")
 	f.BoolVar(&backupVerbose, "verbose", false, "Show oc/kubectl command output")
 	f.StringVar(&backupConfig, "config", "", "Config file path")
+}
+
+var backupListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all available backups",
+	Example: `  okd-backup backup list
+  okd-backup backup list --unit MB
+  okd-backup backup list --backup-dir /mnt/nfs/okd-backups`,
+	RunE: runRestoreList,
+}
+
+func init() {
+	f := backupListCmd.Flags()
+	f.StringVar(&rListBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
+	f.StringVar(&rListUnit, "unit", "GB", "Unit for backup size column (GB or MB)")
+	f.StringVar(&rListConfig, "config", "", "Config file path")
 }
 
 func runBackup(cmd *cobra.Command, args []string) error {
@@ -123,12 +162,16 @@ func runBackup(cmd *cobra.Command, args []string) error {
 	if backupControlPlane == "" {
 		backupControlPlane = cfg["control_plane"]
 	}
-	if backupSSHKey == "~/.ssh/id_rsa" && cfg["ssh_key"] != "" {
+	if backupSSHKey == "~/.ssh/id_ed25519" && cfg["ssh_key"] != "" {
 		backupSSHKey = cfg["ssh_key"]
 	}
 	if backupSSHUser == "core" && cfg["ssh_user"] != "" {
 		backupSSHUser = cfg["ssh_user"]
 	}
+	if backupPVCImage == defaultPVCImage && cfg["pvc_image"] != "" {
+		backupPVCImage = cfg["pvc_image"]
+	}
+	pvcImage = backupPVCImage
 
 	// Auto-detect control plane if etcd backup is requested and no host given
 	if (backupDoAll || backupDoEtcd) && backupControlPlane == "" {
@@ -168,7 +211,7 @@ func runBackup(cmd *cobra.Command, args []string) error {
 			nsList = append(nsList, strings.TrimSpace(n))
 		}
 	}
-	if backupDoAll || backupNamespacesS != "" || backupDoPVCs {
+	if backupDoAll || backupNamespacesS != "" {
 		if err := backupNamespaces(ctx, nsList, !backupNoSecrets, backupDryRun); err != nil {
 			logError(fmt.Sprintf("namespace backup failed: %v", err))
 		}
@@ -193,6 +236,136 @@ func runBackup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// ── download command ──────────────────────────────────────────────────────────
+
+var downloadCmd = &cobra.Command{
+	Use:   "download",
+	Short: "Download OKD release tools (shared across all backups)",
+	Long: `Extract OKD release tools from a release image into <backup-dir>/tools/<name>/.
+Without --release-image the current cluster version is detected automatically.
+Skips the download if already present; use --force to re-download.`,
+	Example: `  # Auto-detect current cluster version and download its tools
+  okd-backup download
+
+  # Download tools for a specific release image
+  okd-backup download --release-image registry.ci.openshift.org/origin/release-scos:4.22.0-0.okd-scos-2026-02-21-014526
+
+  # Skip the confirmation prompt
+  okd-backup download --yes
+
+  # Re-download even if already present
+  okd-backup download --force`,
+	RunE: runDownload,
+}
+
+var (
+	dlReleaseImage string
+	dlBackupDir    string
+	dlForce        bool
+	dlYes          bool
+	dlDryRun       bool
+	dlVerbose      bool
+	dlConfig       string
+)
+
+func init() {
+	f := downloadCmd.Flags()
+	f.StringVar(&dlReleaseImage, "release-image", "", "OKD release image (omit to auto-detect from running cluster)")
+	f.StringVar(&dlBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
+	f.BoolVar(&dlForce, "force", false, "Re-download even if tools are already present")
+	f.BoolVarP(&dlYes, "yes", "y", false, "Skip download confirmation prompt")
+	f.BoolVar(&dlDryRun, "dry-run", false, "Simulate without making changes")
+	f.BoolVar(&dlVerbose, "verbose", false, "Show oc command output")
+	f.StringVar(&dlConfig, "config", "", "Config file path")
+}
+
+func runDownload(cmd *cobra.Command, args []string) error {
+	setVerbose(dlVerbose)
+
+	if dlDryRun {
+		logWarning("DRY-RUN mode active — no changes will be made")
+	}
+
+	if dlReleaseImage == "" {
+		logInfo("No --release-image specified — detecting current cluster version …")
+		img, err := currentReleaseImage()
+		if err != nil {
+			logError(fmt.Sprintf("auto-detect failed: %v", err))
+			logInfo("Specify the release image with --release-image <IMAGE>")
+			os.Exit(1)
+		}
+		dlReleaseImage = img
+		logInfo(fmt.Sprintf("Detected: %s", dlReleaseImage))
+	}
+
+	storageRoot, err := filepath.Abs(resolveBackupDir(dlBackupDir, dlConfig))
+	if err != nil {
+		return err
+	}
+
+	toolsDir, err := downloadTools(storageRoot, dlReleaseImage, dlForce, dlYes, dlDryRun)
+	if err != nil {
+		logError(fmt.Sprintf("download failed: %v", err))
+		os.Exit(1)
+	}
+
+	if !dlDryRun {
+		logSection("Done")
+		logInfo(fmt.Sprintf("Tools directory: %s", toolsDir))
+	}
+	return nil
+}
+
+// ── download list subcommand ──────────────────────────────────────────────────
+
+var (
+	dlListBackupDir string
+	dlListConfig    string
+)
+
+var downloadListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all downloaded release tool sets",
+	Example: `  okd-backup download list
+  okd-backup download list --backup-dir /mnt/nfs/okd-backups`,
+	RunE: runDownloadList,
+}
+
+func init() {
+	f := downloadListCmd.Flags()
+	f.StringVar(&dlListBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
+	f.StringVar(&dlListConfig, "config", "", "Config file path")
+}
+
+func runDownloadList(cmd *cobra.Command, args []string) error {
+	storageRoot, err := filepath.Abs(resolveBackupDir(dlListBackupDir, dlListConfig))
+	if err != nil {
+		return err
+	}
+
+	items, err := listDownloadedTools(storageRoot)
+	if err != nil {
+		return err
+	}
+
+	if len(items) == 0 {
+		logInfo(fmt.Sprintf("No downloaded tool sets found in %s/tools/", storageRoot))
+		logInfo("Run 'okd-backup download' to download the current cluster's tools.")
+		return nil
+	}
+
+	tb := newTable("")
+	tb.addColumn("Name", cyan)
+	tb.addColumn("Downloaded")
+	tb.addColumn("Image")
+
+	for _, dt := range items {
+		tb.addRow(dt.Name, dt.Downloaded, dt.Image)
+	}
+	tb.print()
+	return nil
+}
+
 // ── restore command ───────────────────────────────────────────────────────────
 
 var restoreCmd = &cobra.Command{
@@ -210,7 +383,10 @@ var (
 var restoreListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all available backups",
-	RunE:  runRestoreList,
+	Example: `  okd-backup restore list
+  okd-backup restore list --unit MB
+  okd-backup restore list --backup-dir /mnt/nfs/okd-backups`,
+	RunE: runRestoreList,
 }
 
 func init() {
@@ -245,7 +421,7 @@ func runRestoreList(cmd *cobra.Command, args []string) error {
 	t := newTable("Available backups")
 	t.addColumn("Backup ID", cyan)
 	t.addColumn("Date")
-	t.addColumn("Cluster", dim)
+	t.addColumn("Cluster")
 	t.addColumn("Contents", green)
 	t.addColumn(fmt.Sprintf("Size (%s)", unit), nil, "right")
 
@@ -287,6 +463,7 @@ var (
 	rRunControlPlane  string
 	rRunSSHKey        string
 	rRunSSHUser       string
+	rRunPVCImage      string
 	rRunBackupDir     string
 	rRunDryRun        bool
 	rRunVerbose       bool
@@ -297,7 +474,27 @@ var (
 var restoreRunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Restore resources from a backup",
-	RunE:  runRestoreRun,
+	Example: `  # Restore all namespaces from a backup
+  okd-backup restore run --backup-id 2024-01-15_0200 --namespace production
+
+  # Restore only deployments in a namespace
+  okd-backup restore run --backup-id 2024-01-15_0200 --namespace production --type deployments
+
+  # Restore PVC data
+  okd-backup restore run --backup-id 2024-01-15_0200 --pvcs --namespace production
+
+  # Restore cluster-wide config
+  okd-backup restore run --backup-id 2024-01-15_0200 --cluster-config
+
+  # Restore into a different namespace
+  okd-backup restore run --backup-id 2024-01-15_0200 --map-namespace production:staging
+
+  # Restore etcd via SSH (no live cluster required)
+  okd-backup restore run --backup-id 2024-01-15_0200 --etcd --control-plane 192.168.1.10
+
+  # Auto-create missing namespaces without prompting
+  okd-backup restore run --backup-id 2024-01-15_0200 --namespace production --yes`,
+	RunE: runRestoreRun,
 }
 
 func init() {
@@ -313,8 +510,9 @@ func init() {
 	f.BoolVar(&rRunForceConfig, "force-config", false, "Also restore dangerous cluster-config resources")
 	f.StringVar(&rRunMapNamespace, "map-namespace", "", "Namespace mapping: 'old:new'")
 	f.StringVar(&rRunControlPlane, "control-plane", "", "Hostname or IP of a control plane node (required for --etcd)")
-	f.StringVar(&rRunSSHKey, "ssh-key", "~/.ssh/id_rsa", "SSH private key for control plane access")
+	f.StringVar(&rRunSSHKey, "ssh-key", "~/.ssh/id_ed25519", "SSH private key for control plane access")
 	f.StringVar(&rRunSSHUser, "ssh-user", "core", "SSH user for control plane access")
+	f.StringVar(&rRunPVCImage, "pvc-image", defaultPVCImage, "Container image used for PVC restore pods")
 	f.StringVar(&rRunBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
 	f.BoolVar(&rRunDryRun, "dry-run", false, "Simulate without making changes")
 	f.BoolVar(&rRunVerbose, "verbose", false, "Show oc/kubectl command output")
@@ -334,13 +532,14 @@ func runRestoreRun(cmd *cobra.Command, args []string) error {
 		logWarning("DRY-RUN mode active — no changes will be made")
 	}
 
+	cfg, _ := loadConfig(rRunConfig)
+
 	// Fill SSH params from config (only needed for etcd restore)
 	if rRunEtcd {
-		cfg, _ := loadConfig(rRunConfig)
 		if rRunControlPlane == "" {
 			rRunControlPlane = cfg["control_plane"]
 		}
-		if rRunSSHKey == "~/.ssh/id_rsa" && cfg["ssh_key"] != "" {
+		if rRunSSHKey == "~/.ssh/id_ed25519" && cfg["ssh_key"] != "" {
 			rRunSSHKey = cfg["ssh_key"]
 		}
 		if rRunSSHUser == "core" && cfg["ssh_user"] != "" {
@@ -351,6 +550,11 @@ func runRestoreRun(cmd *cobra.Command, args []string) error {
 			os.Exit(1)
 		}
 	}
+
+	if rRunPVCImage == defaultPVCImage && cfg["pvc_image"] != "" {
+		rRunPVCImage = cfg["pvc_image"]
+	}
+	pvcImage = rRunPVCImage
 
 	storage, err := NewBackupStorage(resolveBackupDir(rRunBackupDir, rRunConfig))
 	if err != nil {
@@ -429,7 +633,10 @@ func runRestoreRun(cmd *cobra.Command, args []string) error {
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all available backups",
-	RunE:  runRestoreList,
+	Example: `  okd-backup list
+  okd-backup list --unit MB
+  okd-backup list --backup-dir /mnt/nfs/okd-backups`,
+	RunE: runRestoreList,
 }
 
 func init() {
@@ -437,6 +644,75 @@ func init() {
 	f.StringVar(&rListBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
 	f.StringVar(&rListUnit, "unit", "GB", "Unit for backup size column (GB or MB)")
 	f.StringVar(&rListConfig, "config", "", "Config file path")
+}
+
+// ── list tree subcommand ──────────────────────────────────────────────────────
+
+var (
+	treeBackupDir string
+	treeConfig    string
+)
+
+var listTreeCmd = &cobra.Command{
+	Use:   "tree <backup-id>",
+	Short: "Show directory tree of a backup",
+	Example: `  okd-backup list tree 2024-01-15_0200
+  okd-backup list tree 2024-01-15_0200 --backup-dir /mnt/nfs/okd-backups`,
+	Args: cobra.ExactArgs(1),
+	RunE: runListTree,
+}
+
+func init() {
+	f := listTreeCmd.Flags()
+	f.StringVar(&treeBackupDir, "backup-dir", defaultBackupDir, "Storage location for backups")
+	f.StringVar(&treeConfig, "config", "", "Config file path")
+}
+
+func runListTree(cmd *cobra.Command, args []string) error {
+	backupID := args[0]
+	storage, err := NewBackupStorage(resolveBackupDir(treeBackupDir, treeConfig))
+	if err != nil {
+		return err
+	}
+
+	ctx, err := storage.OpenBackup(backupID)
+	if err != nil {
+		logError(err.Error())
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s%s/%s\n", colorBold, backupID, colorReset)
+	printDirTree(ctx.Path, "")
+	return nil
+}
+
+// printDirTree recursively prints the directory tree rooted at dir.
+// prefix is the indentation string prepended to each entry.
+func printDirTree(dir, prefix string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for i, entry := range entries {
+		last := i == len(entries)-1
+		connector := "├── "
+		childPrefix := prefix + "│   "
+		if last {
+			connector = "└── "
+			childPrefix = prefix + "    "
+		}
+
+		name := entry.Name()
+		if entry.IsDir() {
+			name += "/"
+		}
+		fmt.Printf("%s%s%s\n", prefix, connector, name)
+
+		if entry.IsDir() {
+			printDirTree(filepath.Join(dir, entry.Name()), childPrefix)
+		}
+	}
 }
 
 // ── info command ──────────────────────────────────────────────────────────────
@@ -450,8 +726,10 @@ var (
 var infoCmd = &cobra.Command{
 	Use:   "info <backup-id>",
 	Short: "Show details of a specific backup",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runInfo,
+	Example: `  okd-backup info 2024-01-15_0200
+  okd-backup info 2024-01-15_0200 --unit MB`,
+	Args: cobra.ExactArgs(1),
+	RunE: runInfo,
 }
 
 func init() {
@@ -533,6 +811,23 @@ Modes (can be combined):
   --older-than N    Remove backups older than N days
   --backup-id ID    Remove a specific backup by ID (use multiple times)
   --empty           Remove backups that have no contents (failed runs)`,
+	Example: `  # Keep only the 5 most recent backups
+  okd-backup cleanup --keep 5
+
+  # Remove backups older than 30 days
+  okd-backup cleanup --older-than 30
+
+  # Remove a specific backup
+  okd-backup cleanup --backup-id 2024-01-15_0200
+
+  # Remove empty/failed backups
+  okd-backup cleanup --empty
+
+  # Preview what would be removed (no deletion)
+  okd-backup cleanup --keep 5 --dry-run
+
+  # Skip confirmation prompt (for scripts)
+  okd-backup cleanup --keep 10 --yes`,
 	RunE: runCleanup,
 }
 
@@ -712,6 +1007,11 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 var scheduleCmd = &cobra.Command{
 	Use:   "schedule",
 	Short: "Manage automated backup schedules (systemd timers or crontab entries)",
+	Example: `  okd-backup schedule generate              # preview daily systemd timer
+  okd-backup schedule generate --install    # write and enable the timer
+  okd-backup schedule generate --type cron  # generate a crontab entry
+  okd-backup schedule list                  # show all installed schedules
+  okd-backup schedule remove                # remove all schedules`,
 }
 
 // schedule generate
@@ -730,7 +1030,24 @@ var (
 var scheduleGenerateCmd = &cobra.Command{
 	Use:   "generate",
 	Short: "Generate (and optionally install) a backup schedule",
-	RunE:  runScheduleGenerate,
+	Example: `  # Preview a daily systemd timer (default)
+  okd-backup schedule generate
+
+  # Preview a weekly systemd timer
+  okd-backup schedule generate --preset weekly
+
+  # Custom schedule using a systemd OnCalendar expression
+  okd-backup schedule generate --on-calendar "Mon..Fri 03:00"
+
+  # Generate a crontab entry instead of systemd
+  okd-backup schedule generate --type cron --preset daily
+
+  # Write and enable the systemd timer (requires root)
+  okd-backup schedule generate --install
+
+  # Back up only namespaces on schedule
+  okd-backup schedule generate --backup-args "backup --namespaces production"`,
+	RunE: runScheduleGenerate,
 }
 
 func init() {
@@ -877,7 +1194,8 @@ func runScheduleCron(cronExpr, backupArgs, label, logFile string, install bool) 
 var scheduleListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List installed okd-backup schedules (systemd timers and crontab entries)",
-	RunE:  runScheduleList,
+	Example: `  okd-backup schedule list`,
+	RunE:    runScheduleList,
 }
 
 func runScheduleList(cmd *cobra.Command, args []string) error {
@@ -1038,7 +1356,18 @@ var (
 var scheduleRemoveCmd = &cobra.Command{
 	Use:   "remove",
 	Short: "Remove an installed okd-backup schedule",
-	RunE:  runScheduleRemove,
+	Example: `  # Remove all installed schedules (systemd + cron)
+  okd-backup schedule remove
+
+  # Remove only the crontab entry
+  okd-backup schedule remove --type cron
+
+  # Remove a specific systemd timer by name
+  okd-backup schedule remove --type systemd --unit-name okd-backup-weekly
+
+  # Skip confirmation prompt
+  okd-backup schedule remove --yes`,
+	RunE: runScheduleRemove,
 }
 
 func init() {
@@ -1190,6 +1519,14 @@ var detectCmd = &cobra.Command{
 Queries the cluster for nodes with the control-plane or master role,
 checks which ones are reachable via SSH, and optionally saves the result
 to the config file.`,
+	Example: `  # List control plane nodes and check SSH reachability
+  okd-backup detect
+
+  # Detect and save the result to the config file
+  okd-backup detect --save
+
+  # Use a non-standard SSH port
+  okd-backup detect --ssh-port 2222`,
 	RunE: runDetect,
 }
 
@@ -1267,9 +1604,10 @@ func runDetect(cmd *cobra.Command, args []string) error {
 // ── deps command ──────────────────────────────────────────────────────────────
 
 var depsCmd = &cobra.Command{
-	Use:   "deps",
-	Short: "Show required external dependencies and check their availability",
-	RunE:  runDeps,
+	Use:     "deps",
+	Short:   "Show required external dependencies and check their availability",
+	Example: `  okd-backup deps`,
+	RunE:    runDeps,
 }
 
 func runDeps(cmd *cobra.Command, args []string) error {
@@ -1292,7 +1630,7 @@ func runDeps(cmd *cobra.Command, args []string) error {
 	binTable := newTable("")
 	binTable.addColumn("Binary", cyan)
 	binTable.addColumn("Purpose")
-	binTable.addColumn("Required for", dim)
+	binTable.addColumn("Required for")
 	binTable.addColumn("Status")
 
 	ocFound := isInPath("oc")
@@ -1475,12 +1813,18 @@ func systemctlVersion() string {
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Manage the okd-backup configuration file",
+	Example: `  okd-backup config show                             # show current config
+  okd-backup config set backup_dir /mnt/nfs/backups  # set a value
+  okd-backup config unset control_plane              # remove a key
+  okd-backup config path                             # show config file location`,
 }
 
 var configShowCmd = &cobra.Command{
 	Use:   "show",
 	Short: "Show the current configuration and where it was loaded from",
-	RunE:  runConfigShow,
+	Example: `  okd-backup config show
+  okd-backup config show --config ./okd-backup.yaml`,
+	RunE: runConfigShow,
 }
 
 var cfgShowConfig string
@@ -1496,34 +1840,36 @@ func runConfigShow(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 	if found == "" {
-		logWarning("No config file found.")
-		logInfo("Create one with: okd-backup config set backup_dir <path>  or copy okd-backup.yaml.example to okd-backup.yaml")
-		return nil
+		logInfo("No config file found — showing built-in defaults.")
+		logInfo("Create one with: okd-backup config set <key> <value>")
+	} else {
+		logInfo(fmt.Sprintf("Config file: %s", found))
 	}
 
-	logInfo(fmt.Sprintf("Config file: %s", found))
-	values, err := loadConfig(cfgShowConfig)
-	if err != nil {
-		logError(err.Error())
-		os.Exit(1)
-	}
-
-	if len(values) == 0 {
-		logInfo("Config file is empty.")
-		return nil
+	values, _ := loadConfig(cfgShowConfig)
+	if values == nil {
+		values = map[string]string{}
 	}
 
 	tb := newTable("")
 	tb.addColumn("Key", cyan)
 	tb.addColumn("Value")
+	tb.addColumn("Source")
 
-	keys := make([]string, 0, len(values))
-	for k := range values {
+	keys := make([]string, 0, len(validConfigKeys))
+	for k := range validConfigKeys {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
 	for _, k := range keys {
-		tb.addRow(k, values[k])
+		if v, ok := values[k]; ok {
+			tb.addRow(k, v, "set")
+		} else if def, ok := configDefaults[k]; ok {
+			tb.addRow(k, def, "default")
+		} else {
+			tb.addRow(k, "—", "")
+		}
 	}
 	tb.print()
 	return nil
@@ -1537,8 +1883,13 @@ var configSetCmd = &cobra.Command{
 Keys:
   backup_dir     Default backup storage directory
   control_plane  Hostname or IP of the control plane node
-  ssh_key        Path to the SSH private key
-  ssh_user       SSH user for control plane access (default: core)`,
+  ssh_key        Path to the SSH private key (default: ~/.ssh/id_ed25519)
+  ssh_user       SSH user for control plane access (default: core)
+  pvc_image      Container image for PVC backup/restore pods (default: ubi8)`,
+	Example: `  okd-backup config set backup_dir /mnt/nfs/okd-backups
+  okd-backup config set control_plane 192.168.1.10
+  okd-backup config set ssh_key ~/.ssh/okd_key
+  okd-backup config set ssh_user core`,
 	Args: cobra.ExactArgs(2),
 	RunE: runConfigSet,
 }
@@ -1593,8 +1944,10 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 var configUnsetCmd = &cobra.Command{
 	Use:   "unset <key>",
 	Short: "Remove a key from the configuration file",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runConfigUnset,
+	Example: `  okd-backup config unset control_plane
+  okd-backup config unset ssh_key`,
+	Args: cobra.ExactArgs(1),
+	RunE: runConfigUnset,
 }
 
 var cfgUnsetConfig string
@@ -1635,9 +1988,10 @@ func runConfigUnset(cmd *cobra.Command, args []string) error {
 }
 
 var configPathCmd = &cobra.Command{
-	Use:   "path",
-	Short: "Show the config file search order and which file would be used",
-	RunE:  runConfigPath,
+	Use:     "path",
+	Short:   "Show the config file search order and which file would be used",
+	Example: `  okd-backup config path`,
+	RunE:    runConfigPath,
 }
 
 func runConfigPath(cmd *cobra.Command, args []string) error {
@@ -1730,11 +2084,11 @@ _okd_backup_completion() {
         cword=$COMP_CWORD
     }
 
-    local top_commands="backup restore list info completion detect deps config schedule cleanup version --help"
+    local top_commands="backup download restore list info completion detect deps config schedule cleanup version --help"
     local restore_subcommands="list run"
     local schedule_subcommands="generate list remove"
     local config_subcommands="show set unset path"
-    local config_keys="backup_dir control_plane ssh_key ssh_user"
+    local config_keys="backup_dir control_plane ssh_key ssh_user pvc_image"
 
     _okd_backup_get_backup_dir() {
         local dir="/mnt/nfs/okd-backups"
@@ -1782,11 +2136,15 @@ _okd_backup_completion() {
     local i
     for (( i=1; i<cword; i++ )); do
         case "${words[$i]}" in
-            backup|info|completion|detect|deps|cleanup)
+            download|info|completion|detect|deps|cleanup)
                 cmd="${words[$i]}"; break ;;
-            restore|schedule|config)
+            backup|restore|schedule|config)
                 cmd="${words[$i]}" ;;
-            list|run)
+            list)
+                if [[ "$cmd" == "restore" || "$cmd" == "backup" ]]; then
+                    subcmd="${words[$i]}"; break
+                fi ;;
+            run)
                 [[ "$cmd" == "restore" ]] && { subcmd="${words[$i]}"; break; } ;;
             generate|remove)
                 [[ "$cmd" == "schedule" ]] && { subcmd="${words[$i]}"; cmd="schedule_${subcmd}"; break; } ;;
@@ -1839,10 +2197,22 @@ _okd_backup_completion() {
         "") COMPREPLY=( $(compgen -W "$top_commands" -- "$cur") ) ;;
 
         backup)
-            local opts="--all --etcd --namespaces --pvcs --cluster-config \
-                --no-secrets --backup-dir --control-plane --ssh-key --ssh-user \
-                --config --dry-run --verbose --help"
-            COMPREPLY=( $(compgen -W "$opts" -- "$cur") ) ;;
+            if [[ -z "$subcmd" ]]; then
+                local opts="list --all --etcd --namespaces --pvcs --cluster-config \
+                    --no-secrets --backup-dir --control-plane --ssh-key --ssh-user \
+                    --config --dry-run --verbose --help"
+                COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+            elif [[ "$subcmd" == "list" ]]; then
+                COMPREPLY=( $(compgen -W "--backup-dir --unit --config --help" -- "$cur") )
+            fi ;;
+
+        download)
+            if [[ -z "$subcmd" ]]; then
+                COMPREPLY=( $(compgen -W "list --release-image --backup-dir --force \
+                    --yes --config --dry-run --verbose --help" -- "$cur") )
+            elif [[ "$subcmd" == "list" ]]; then
+                COMPREPLY=( $(compgen -W "--backup-dir --config --help" -- "$cur") )
+            fi ;;
 
         restore)
             if [[ -z "$subcmd" ]]; then
@@ -1857,7 +2227,15 @@ _okd_backup_completion() {
             fi ;;
 
         list)
-            COMPREPLY=( $(compgen -W "--backup-dir --unit --config --help" -- "$cur") ) ;;
+            if [[ -z "$subcmd" ]]; then
+                COMPREPLY=( $(compgen -W "tree --backup-dir --unit --config --help" -- "$cur") )
+            elif [[ "$subcmd" == "tree" ]]; then
+                case "$cur" in
+                    -*) COMPREPLY=( $(compgen -W "--backup-dir --config --help" -- "$cur") ) ;;
+                    *)  local ids; ids=$(_okd_backup_list_ids)
+                        COMPREPLY=( $(compgen -W "$ids" -- "$cur") ) ;;
+                esac
+            fi ;;
 
         info)
             case "$cur" in
@@ -1935,7 +2313,7 @@ _okd_backup() {
         networkpolicies resourcequotas limitranges imagestreams
     )
 
-    local config_keys=(backup_dir control_plane ssh_key ssh_user)
+    local config_keys=(backup_dir control_plane ssh_key ssh_user pvc_image)
 
     local _backup_dir="/mnt/nfs/okd-backups"
     if [[ -n "${opt_args[--backup-dir]}" ]]; then
@@ -1962,6 +2340,7 @@ _okd_backup() {
         command)
             local commands=(
                 'backup:Create a backup of the OKD cluster'
+                'download:Download OKD release tools into a backup'
                 'restore:Restore resources from a backup'
                 'list:List all available backups'
                 'info:Show details of a specific backup'
@@ -1979,7 +2358,10 @@ _okd_backup() {
         args)
             case $line[1] in
                 backup)
-                    _arguments \
+                    local bk_subcmds=(
+                        'list:List all available backups'
+                    )
+                    _arguments ':subcommand:->bk_sub' '*::args:->bk_args' \
                         '--all[Back up everything]' \
                         '--etcd[etcd snapshot]' \
                         '--namespaces[Namespaces]:ns:->namespaces' \
@@ -1993,6 +2375,45 @@ _okd_backup() {
                         '--config[Config file]:file:_files' \
                         '--dry-run[Simulate]' \
                         '--verbose[Show oc output]'
+                    case $state in
+                        bk_sub) _describe 'subcommand' bk_subcmds ;;
+                        bk_args)
+                            case $line[1] in
+                                list)
+                                    _arguments \
+                                        '--backup-dir[Storage location]:dir:_files -/' \
+                                        '--unit[Size unit]:unit:(GB MB)' \
+                                        '--config[Config file]:file:_files'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                download)
+                    local dl_subcmds=(
+                        'list:List all downloaded release tool sets'
+                    )
+                    _arguments ':subcommand:->dl_sub' '*::args:->dl_args' \
+                        '--release-image[OKD release image (optional)]:image:' \
+                        '--backup-dir[Storage location]:dir:_files -/' \
+                        '--force[Re-download even if already present]' \
+                        '(-y --yes)'{-y,--yes}'[Skip confirmation prompt]' \
+                        '--config[Config file]:file:_files' \
+                        '--dry-run[Simulate]' \
+                        '--verbose[Show oc output]'
+                    case $state in
+                        dl_sub) _describe 'subcommand' dl_subcmds ;;
+                        dl_args)
+                            case $line[1] in
+                                list)
+                                    _arguments \
+                                        '--backup-dir[Storage location]:dir:_files -/' \
+                                        '--config[Config file]:file:_files'
+                                    ;;
+                            esac
+                            ;;
+                    esac
                     ;;
 
                 restore)
@@ -2032,10 +2453,26 @@ _okd_backup() {
                     ;;
 
                 list)
-                    _arguments \
+                    local list_subcmds=(
+                        'tree:Show directory tree of a backup'
+                    )
+                    _arguments ':subcommand:->list_sub' '*::args:->list_args' \
                         '--backup-dir[Storage location]:dir:_files -/' \
                         '--unit[Size unit]:unit:(GB MB)' \
                         '--config[Config file]:file:_files'
+                    case $state in
+                        list_sub) _describe 'subcommand' list_subcmds ;;
+                        list_args)
+                            case $line[1] in
+                                tree)
+                                    _arguments \
+                                        ':backup_id:->backup_ids' \
+                                        '--backup-dir[Storage location]:dir:_files -/' \
+                                        '--config[Config file]:file:_files'
+                                    ;;
+                            esac
+                            ;;
+                    esac
                     ;;
 
                 info)
@@ -2117,7 +2554,7 @@ _okd_backup() {
                             case $line[1] in
                                 set)
                                     _arguments \
-                                        ':key:(backup_dir control_plane ssh_key ssh_user)' \
+                                        ':key:(backup_dir control_plane ssh_key ssh_user pvc_image)' \
                                         ':value:->config_value'
                                     case $state in
                                         config_value)
